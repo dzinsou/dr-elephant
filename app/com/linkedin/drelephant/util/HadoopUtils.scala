@@ -67,9 +67,6 @@ trait HadoopUtils {
     nameServices.flatMap(findNameNodeAddressInNameServices)
   }
 
-  def httpNameNodeAddress(conf: Configuration): Option[String] = Option(conf.get(DFS_NAMENODE_HTTP_ADDRESS_KEY))
-
-  def httpNameNodeAddress(conf: Configuration): Option[String] = Option(conf.get(DFS_NAMENODE_HTTP_ADDRESS_KEY))
   def httpNameNodeAddress(conf: Configuration): Option[String] = Option(conf.get(getNameNodeHttpAddressKey(conf)))
 
   def isActiveNameNode(hostAndPort: String): Boolean = {
