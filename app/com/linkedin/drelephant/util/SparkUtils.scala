@@ -22,9 +22,9 @@ import java.util.Properties
 
 import scala.collection.JavaConverters
 import scala.collection.mutable.HashMap
-
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileSystem, Path, PathFilter, FileStatus}
+import org.apache.hadoop.fs.{FileStatus, FileSystem, Path, PathFilter}
+import org.apache.hadoop.hdfs.DFSConfigKeys
 import org.apache.log4j.Logger
 import org.apache.spark.SparkConf
 import org.apache.spark.io.{CompressionCodec, LZ4CompressionCodec, LZFCompressionCodec, SnappyCompressionCodec}
@@ -42,6 +42,9 @@ trait SparkUtils {
   val SPARK_EVENT_LOG_DIR_KEY = "spark.eventLog.dir"
   val SPARK_EVENT_LOG_COMPRESS_KEY = "spark.eventLog.compress"
   val DFS_HTTP_PORT = 50070
+
+  val WEBHDFS_SCHEME = "webhdfs" // see org.apache.hadoop.hdfs.web.WebHdfsConstants
+  val SWEBHDFS_SCHEME = "swebhdfs" // see org.apache.hadoop.hdfs.web.WebHdfsConstants
 
   /**
     * Returns the webhdfs FileSystem and Path for the configured Spark event log directory and optionally the
@@ -67,14 +70,19 @@ trait SparkUtils {
         case Some(uri) if uri.getScheme == "webhdfs" =>
           (FileSystem.get(uri, hadoopConfiguration), new Path(uri.getPath))
         case Some(uri) if uri.getScheme == "hdfs" =>
-          (FileSystem.get(new URI(s"webhdfs://${uri.getHost}:${DFS_HTTP_PORT}${uri.getPath}"), hadoopConfiguration), new Path(uri.getPath))
+          val dfs_http_scheme = getWebHdfsPrefixScheme(hadoopConfiguration)
+          val dfs_http_port = getNameNodeHttpPort(hadoopConfiguration)
+          val dfs_http_uri = s"$dfs_http_scheme${uri.getHost}:$dfs_http_port${uri.getPath}"
+          (FileSystem.get(new URI(dfs_http_uri), hadoopConfiguration), new Path(uri.getPath))
         case Some(uri) =>
           val nameNodeAddress
           = hadoopUtils.findHaNameNodeAddress(hadoopConfiguration)
             .orElse(hadoopUtils.httpNameNodeAddress(hadoopConfiguration))
           nameNodeAddress match {
             case Some(address) =>
-              (FileSystem.get(new URI(s"webhdfs://${address}${uri.getPath}"), hadoopConfiguration), new Path(uri.getPath))
+              val dfs_http_scheme = getWebHdfsPrefixScheme(hadoopConfiguration)
+              val dfs_http_uri = s"$dfs_http_scheme$address${uri.getPath}"
+              (FileSystem.get(new URI(dfs_http_uri), hadoopConfiguration), new Path(uri.getPath))
             case None =>
               throw new IllegalArgumentException("Couldn't find configured namenode")
           }
@@ -82,6 +90,20 @@ trait SparkUtils {
           throw new IllegalArgumentException("${SPARK_EVENT_LOG_DIR_KEY} not provided")
       }
     }
+  }
+
+  def getWebHdfsPrefixScheme(conf: Configuration): String = {
+    if (hadoopUtils.isHdfsSslEnabled(conf))
+      SWEBHDFS_SCHEME + "://"
+    else
+      WEBHDFS_SCHEME + "://"
+  }
+
+  def getNameNodeHttpPort(conf: Configuration): String = {
+    if (hadoopUtils.isHdfsSslEnabled(conf))
+      conf.get(DFSConfigKeys.DFS_NAMENODE_HTTPS_PORT_KEY, DFSConfigKeys.DFS_NAMENODE_HTTPS_PORT_DEFAULT.toString)
+    else
+      conf.get(DFSConfigKeys.DFS_NAMENODE_HTTP_PORT_KEY, DFSConfigKeys.DFS_NAMENODE_HTTP_PORT_DEFAULT.toString)
   }
 
   /**
@@ -106,10 +128,14 @@ trait SparkUtils {
     appId: String,
     attemptId: Option[String]
   ): (Path, Option[CompressionCodec]) = {
+    logger.info("pathAndCodecforEventLog - appId: " + appId)
+    logger.info("pathAndCodecforEventLog - attemptId: " + attemptId)
+    logger.info("pathAndCodecforEventLog - basePath: " + basePath)
     attemptId match {
       // if attemptid is given, use the existing method
       case x: Some[String] => { val path = {
           val shouldUseCompression = sparkConf.getBoolean(SPARK_EVENT_LOG_COMPRESS_KEY, defaultValue = false)
+          logger.info("pathAndCodecforEventLog - shouldUseCompression: " + shouldUseCompression)
           val compressionCodecShortName =
             if (shouldUseCompression) Some(shortNameOfCompressionCodec(compressionCodecFromConf(sparkConf))) else None
           getLogPath(fs.getUri.resolve(basePath.toUri), appId, attemptId, compressionCodecShortName)
@@ -119,8 +145,13 @@ trait SparkUtils {
       }
       case None => {
         val (logPath, codecName) = getLogPathAndCodecName(fs, fs.getUri.resolve(basePath.toUri), appId)
+        logger.info("pathAndCodecforEventLog - logPath: " + logPath)
+        logger.info("pathAndCodecforEventLog - codecName: " + codecName)
 
-        (logPath, Some(compressionCodecMap.getOrElseUpdate(codecName, loadCompressionCodec(sparkConf, codecName))))
+        if (codecName.isDefined)
+          (logPath, Some(compressionCodecMap.getOrElseUpdate(codecName.get, loadCompressionCodec(sparkConf, codecName.get))))
+        else
+          (logPath, None)
       }
     }
 
@@ -242,7 +273,7 @@ trait SparkUtils {
                                     fs: FileSystem,
                                     logBaseDir: URI,
                                     appId: String
-                                    ): (Path, String) = {
+                                    ): (Path, Option[String]) = {
     val base = logBaseDir.toString.stripSuffix("/");
     val filter = new PathFilter() {
        override def accept(file: Path): Boolean = {
@@ -264,19 +295,22 @@ trait SparkUtils {
       case noAttempt if noAttempt._1 != None & noAttempt._2 == None & noAttempt._3 != None =>
                                                           (new Path(base +
                                                               "/" + finalAttempt._1.get +
-                                                              "." + finalAttempt._3.get), finalAttempt._3.get)
+                                                              "." + finalAttempt._3.get), Option(finalAttempt._3.get))
       // if attemptId is available and the codec is available, use the appid with attemptid suffix
       case attempt if attempt._1 != None & attempt._2 != None & attempt._3 != None =>
                                                           (new Path(base +
                                                                 "/" + attempt._1.get +
                                                                 "_" + sanitize(finalAttempt._2.get) +
-                                                                "." + finalAttempt._3.get), finalAttempt._3.get)
+                                                                "." + finalAttempt._3.get), Option(finalAttempt._3.get))
       // if codec is not available, but we found a file match with appId, use the actual file Path from the first match
-      case nocodec if nocodec._1 != None & nocodec._3 == None => (attemptsList(0).getPath(), DEFAULT_COMPRESSION_CODEC)
+      case nocodec if nocodec._1 != None & nocodec._3 == None => (attemptsList(0).getPath(), Option(DEFAULT_COMPRESSION_CODEC))
+
+      // if attemptId is none and codec is not available
+      case noAttemptAndNoCodec if noAttemptAndNoCodec._2.isEmpty & noAttemptAndNoCodec._3.isEmpty => (new Path(base + "/" + appId), None)
 
       // This should be reached only if we can't parse the filename in the path.
       // Try to construct a general path in that case.
-      case _ => (new Path(base + "/" + appId + "." + DEFAULT_COMPRESSION_CODEC), DEFAULT_COMPRESSION_CODEC)
+      case _ => (new Path(base + "/" + appId + "." + DEFAULT_COMPRESSION_CODEC), Option(DEFAULT_COMPRESSION_CODEC))
     }
   }
 
